@@ -12,26 +12,55 @@ Firmoscope searches Google Maps for businesses matching your query, then extract
 
 ---
 
+## Installation
+
+### Option 1 — pipx (recommended)
+
+```bash
+pipx install firmoscope
+playwright install chromium
+firmoscope "Rybnik Mechanicy"
+```
+
+> Install pipx first if needed: `pip install pipx`
+
+### Option 2 — pip
+
+```bash
+pip install firmoscope
+playwright install chromium
+firmoscope "Rybnik Mechanicy"
+```
+
+### Option 3 — manual (no install)
+
+```bash
+pip install playwright
+playwright install chromium
+python firmoscope.py
+```
+
+---
+
 ## Quick start
 
 ```bash
-# Install
-pip install playwright
-playwright install chromium
-
 # Run interactively
+firmoscope
+
+# Run interactively (manual install)
 python firmoscope.py
 
 # Run with arguments
-python firmoscope.py "Rybnik Mechanicy"
-python firmoscope.py "Katowice Restauracje" --limit 30
-python firmoscope.py "Gliwice Dentyści" --limit 50 --output leady_dent.csv
+firmoscope "Rybnik Mechanicy"
+firmoscope "Katowice Restauracje" --limit 30
+firmoscope "Gliwice Dentyści" --limit 50 --output leady_dent.csv
 
 # Only businesses without a website (best leads)
-python firmoscope.py "Wrocław Hydraulicy" --no-website
+firmoscope "Wrocław Hydraulicy" --no-website
 
 # Watch the browser (non-headless)
-python firmoscope.py "Kraków Fryzjer" --no-headless
+firmoscope "Kraków Fryzjer" --no-headless
 ```
 
 ---
@@ -42,13 +71,13 @@ Requires `OPENROUTER_API_KEY` set in your environment.
 
 ```bash
 # One-shot AI question about the results
-python firmoscope.py "Rybnik Mechanicy" --limit 10 --ai "które firmy nie mają strony?"
+firmoscope "Rybnik Mechanicy" --limit 10 --ai "które firmy nie mają strony?"
 
 # Interactive chat session
-python firmoscope.py "Rybnik Mechanicy" --limit 10 --chat
+firmoscope "Rybnik Mechanicy" --limit 10 --chat
 
 # Pick a specific model
-python firmoscope.py "Rybnik Mechanicy" --chat --model "anthropic/claude-3.5-haiku"
+firmoscope "Rybnik Mechanicy" --chat --model "anthropic/claude-3.5-haiku"
 ```
 
 ---

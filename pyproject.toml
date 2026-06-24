@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "firmoscope"
+version = "0.1.0"
+description = "Business lead scraper CLI powered by Playwright"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["playwright"]
+
+[project.scripts]
+firmoscope = "firmoscope:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["firmoscope*"]

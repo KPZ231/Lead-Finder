@@ -1,5 +1,21 @@
-/config
-/__pycache__
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Env
+.env
+*.env
+
+# Secrets / config
 client_secret.json
-*.csv
 .firmoscope_config.json
+
+# Output
+*.csv
+
+# IDE
+.vscode/
+.idea/
