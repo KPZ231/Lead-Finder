@@ -1,0 +1,15 @@
+gspread>=6.0
+google-auth-oauthlib>=1.0
+certifi==2026.6.17
+charset-normalizer==3.4.7
+docopt==0.6.2
+git-filter-repo==2.47.0
+greenlet==3.5.2
+idna==3.18
+pipreqs==0.4.13
+playwright==1.60.0
+pyee==13.0.1
+requests==2.34.2
+typing_extensions==4.15.0
+urllib3==2.7.0
+yarg==0.1.10
