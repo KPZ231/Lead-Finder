@@ -23,6 +23,18 @@ except ImportError:
     print("  Run: pip install playwright && playwright install chromium\n")
     sys.exit(1)
 
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import WordCompleter
+    from prompt_toolkit.styles import Style as PTStyle
+    _PT = True
+except ImportError:
+    _PT = False
+
+# Commands available for autocomplete
+_COMMANDS = ["/search", "/export sheets", "/provider", "/help", "/exit"]
+_CMD_COMPLETER = WordCompleter(_COMMANDS, sentence=True) if _PT else None
+
 # ─────────────────────────────────────────────────
 #  ANSI STYLES
 # ─────────────────────────────────────────────────
@@ -107,7 +119,18 @@ def spinner_end(result=""):
     sys.stdout.write(f"{r}\n")
     sys.stdout.flush()
 
-def prompt(symbol="❯", color=C.TEAL):
+_pt_session = None  # ponytail: single shared PromptSession (keeps history)
+
+def prompt(symbol="❯", color=C.TEAL, completer=None):
+    global _pt_session
+    if _PT and completer is not None:
+        if _pt_session is None:
+            _pt_session = PromptSession()
+        try:
+            # ponytail: prompt_toolkit rejects raw ANSI — use plain prefix
+            return _pt_session.prompt(f"  {symbol} ", completer=completer).strip()
+        except (KeyboardInterrupt, EOFError):
+            return None
     sys.stdout.write(f"  {style(symbol, C.BOLD, color)} ")
     sys.stdout.flush()
     try:
@@ -752,7 +775,7 @@ def run_ai_repl(provider: str, model: str):
     _last_results = []  # ponytail: session cache for /export sheets
 
     while True:
-        line = prompt("❯", C.BLUE)
+        line = prompt("❯", C.BLUE, completer=_CMD_COMPLETER)
         if line is None:
             break
 

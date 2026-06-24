@@ -2,3 +2,4 @@
 /__pycache__
 client_secret.json
 *.csv
+.firmoscope_config.json
