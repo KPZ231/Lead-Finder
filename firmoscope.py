@@ -13,6 +13,7 @@ import os
 import re
 import json
 import urllib.request
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 
@@ -245,6 +246,14 @@ def ask_ai(messages: list, provider: str, model: str, tools: list = None) -> tup
             data = json.loads(resp.read())
         return normalize_response(data, provider)
 
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            pass
+        log_error(f"AI error: HTTP {e.code} — {body or e.reason}")
+        return "", []
     except Exception as e:
         log_error(f"AI error: {e}")
         return "", []
@@ -442,12 +451,20 @@ async def run_scraper(query: str, max_results: int = 20, output_file: str = None
         spinner_end("OK")
 
         spinner_start(f"Loading Google Maps: {query}")
-        try:
-            await page.goto(maps_url, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(2500)
-        except Exception as e:
+        # ponytail: single retry — transient DNS/IPv6 blips shouldn't kill the run
+        last_err = None
+        for attempt in range(2):
+            try:
+                await page.goto(maps_url, wait_until="domcontentloaded", timeout=20000)
+                await page.wait_for_timeout(2500)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                await page.wait_for_timeout(1500)
+        if last_err is not None:
             spinner_end()
-            log_error(f"Failed to load Google Maps: {e}")
+            log_error(f"Failed to load Google Maps: {last_err}")
             await browser.close()
             return []
         spinner_end("loaded")
@@ -900,19 +917,74 @@ def run_ai_repl(provider: str, model: str):
 #  ENTRY POINT
 # ─────────────────────────────────────────────────
 
-def main():
-    print_logo()
+def _resolve_provider(model_override: str = None) -> tuple:
+    """Provider/model from saved config (or interactive pick), model overridable."""
+    cfg = _load_config()
+    if cfg.get("provider") and (model_override or cfg.get("model")):
+        return cfg["provider"], (model_override or cfg["model"])
+    provider, model = pick_provider()
+    return provider, (model_override or model)
 
-    # Check for --selftest flag (ponytail: self-check, no framework)
-    if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
+
+def main():
+    import argparse
+
+    if "--selftest" in sys.argv:
+        print_logo()
         _selftest()
         return
 
-    provider, model = pick_provider()
-    run_ai_repl(provider, model)
-    print()
-    log_success("Goodbye!")
-    print()
+    p = argparse.ArgumentParser(
+        prog="firmoscope",
+        description="Google Maps business lead scraper. No query → interactive AI chat.",
+    )
+    p.add_argument("query", nargs="?", help="Search query, e.g. 'Rybnik Mechanicy'")
+    p.add_argument("--limit", type=int, default=20, help="Max results (default 20)")
+    p.add_argument("--output", help="Output CSV filename (auto-generated if omitted)")
+    p.add_argument("--no-website", action="store_true",
+                   help="Only businesses without a website (leads)")
+    p.add_argument("--no-headless", action="store_true", help="Show the browser window")
+    p.add_argument("--ai", metavar="QUESTION",
+                   help="Scrape QUERY then ask the AI this question about the results")
+    p.add_argument("--chat", action="store_true", help="Open the interactive AI chat")
+    p.add_argument("--model", help="Override AI model id")
+    p.add_argument("--selftest", action="store_true", help="Run self-check and exit")
+    args = p.parse_args()
+
+    print_logo()
+
+    # Interactive chat: explicit --chat, or no query given at all
+    if args.chat or not args.query:
+        provider, model = _resolve_provider(args.model)
+        run_ai_repl(provider, model)
+        print()
+        log_success("Goodbye!")
+        print()
+        return
+
+    # One-shot scrape
+    results = asyncio.run(run_scraper(
+        query=args.query,
+        max_results=args.limit,
+        output_file=args.output,
+        headless=not args.no_headless,
+        no_website_only=args.no_website,
+    ))
+
+    # Optional AI analysis of the scraped results
+    if args.ai:
+        provider, model = _resolve_provider(args.model)
+        messages = [
+            {"role": "system", "content": AI_SYSTEM},
+            {"role": "user", "content": (
+                f"{args.ai}\n\nScraped results:\n{results_to_tool_content(results)}"
+            )},
+        ]
+        spinner_start("Analyzing...")
+        content, _ = ask_ai(messages, provider, model)
+        spinner_end()
+        if content:
+            print(f"\n  {blue('AI')}  {content}\n")
 
 
 def _selftest():
