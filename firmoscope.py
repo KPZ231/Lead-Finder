@@ -33,7 +33,7 @@ except ImportError:
     _PT = False
 
 # Commands available for autocomplete
-_COMMANDS = ["/search", "/export sheets", "/provider", "/help", "/exit"]
+_COMMANDS = ["/search", "/swarm", "/export sheets", "/provider", "/help", "/exit"]
 _CMD_COMPLETER = WordCompleter(_COMMANDS, sentence=True) if _PT else None
 
 # ─────────────────────────────────────────────────
@@ -403,12 +403,48 @@ async def try_scrape_website_for_email(page, website_url: str) -> str:
     return ""
 
 
+def save_and_summarize(results: list, output_file: str):
+    """Write results to CSV and print the summary block."""
+    if results:
+        spinner_start(f"Saving {len(results)} results to CSV")
+        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=list(results[0].keys()))
+            writer.writeheader()
+            writer.writerows(results)
+        spinner_end(f"OK  →  {output_file}")
+
+        print()
+        with_phone   = sum(1 for r in results if r["Phone"])
+        with_email   = sum(1 for r in results if r["Email"])
+        no_web_count = sum(1 for r in results if r["Has Website"] == "NO")
+
+        print_divider()
+        print(f"  {teal('◈')}  {white('SUMMARY')}")
+        print_divider()
+        print(f"  {gray('Total businesses  :')}  {white(str(len(results)))}")
+        print(f"  {gray('With phone        :')}  {mint(str(with_phone))}")
+        print(f"  {gray('With email        :')}  {blue(str(with_email))}")
+        print(f"  {gray('No website        :')}  {gold(str(no_web_count))}  {dim('← potential leads')}")
+        print_divider()
+        log_success(f"Done! File: {output_file}")
+        # ponytail: os.startfile is Windows-only; add xdg-open/open branch if this ever runs on Linux/mac
+        try:
+            os.startfile(Path(output_file).resolve())
+        except Exception as e:
+            log_warn(f"Could not auto-open CSV: {e}")
+    else:
+        log_error("No results found. Check your query.")
+    print()
+
+
 async def run_scraper(query: str, max_results: int = 20, output_file: str = None,
                       headless: bool = True, no_website_only: bool = False,
-                      silent: bool = False) -> list:
+                      silent: bool = False, write_csv: bool = True) -> list:
     """
     Run the Google Maps scraper. Returns list of result dicts.
     silent=True suppresses the logo/divider (used when called from AI tool).
+    write_csv=False skips the CSV write + summary (used by swarm sub-runs).
     """
     if not output_file:
         safe_q = re.sub(r'[^\w\s-]', '', query).strip().replace(' ', '_')
@@ -436,6 +472,10 @@ async def run_scraper(query: str, max_results: int = 20, output_file: str = None
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--lang=en-US",
+                # ponytail: prefer OS resolver — Chromium's built-in async/DoH
+                # resolver is what throws ERR_NAME_NOT_RESOLVED while the OS resolves fine
+                "--disable-features=UseDnsHttpsSvcb,UseDnsHttpsSvcbHttps,AsyncDns",
+                "--dns-over-https-mode=off",
             ]
         )
         context = await browser.new_context(
@@ -465,6 +505,8 @@ async def run_scraper(query: str, max_results: int = 20, output_file: str = None
         if last_err is not None:
             spinner_end()
             log_error(f"Failed to load Google Maps: {last_err}")
+            if "ERR_NAME_NOT_RESOLVED" in str(last_err):
+                log_warn("DNS could not resolve google.com — check your internet / VPN / DNS.")
             await browser.close()
             return []
         spinner_end("loaded")
@@ -591,35 +633,78 @@ async def run_scraper(query: str, max_results: int = 20, output_file: str = None
         print_divider()
         await browser.close()
 
-    # Save CSV
-    if results:
-        spinner_start(f"Saving {len(results)} results to CSV")
-        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-        with open(output_file, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=list(results[0].keys()))
-            writer.writeheader()
-            writer.writerows(results)
-        spinner_end(f"OK  →  {output_file}")
-
-        print()
-        with_phone   = sum(1 for r in results if r["Phone"])
-        with_email   = sum(1 for r in results if r["Email"])
-        no_web_count = sum(1 for r in results if r["Has Website"] == "NO")
-
-        print_divider()
-        print(f"  {teal('◈')}  {white('SUMMARY')}")
-        print_divider()
-        print(f"  {gray('Total businesses  :')}  {white(str(len(results)))}")
-        print(f"  {gray('With phone        :')}  {mint(str(with_phone))}")
-        print(f"  {gray('With email        :')}  {blue(str(with_email))}")
-        print(f"  {gray('No website        :')}  {gold(str(no_web_count))}  {dim('← potential leads')}")
-        print_divider()
-        log_success(f"Done! File: {output_file}")
-    else:
-        log_error("No results found. Check your query.")
-
-    print()
+    if write_csv:
+        save_and_summarize(results, output_file)
     return results
+
+
+# ─────────────────────────────────────────────────
+#  AGENT SWARM
+# ─────────────────────────────────────────────────
+
+SWARM_SPLIT_PROMPT = (
+    "Split this business search into {n} DISTINCT, non-overlapping sub-searches "
+    "that together cover it more thoroughly — by district/neighbourhood or by "
+    "business subcategory. Reply with ONLY a JSON array of {n} short query strings.\n\n"
+    "Search: {q}"
+)
+
+
+def parse_query_list(text: str, n: int) -> list:
+    """Extract up to n query strings from an LLM reply (JSON array, fenced or raw)."""
+    m = re.search(r'\[.*\]', text or "", re.S)
+    if m:
+        try:
+            arr = json.loads(m.group(0))
+            qs = [str(q).strip() for q in arr if str(q).strip()]
+            if qs:
+                return qs[:n]
+        except Exception:
+            pass
+    return []  # caller falls back to [base_query]
+
+
+async def run_swarm(base_query: str, provider: str, model: str, n: int = 3,
+                    max_results: int = 20, no_website_only: bool = False,
+                    output_file: str = None) -> list:
+    """Fan out N scraper agents over LLM-generated sub-scopes, merge + dedupe.
+    ponytail: N parallel browsers is the ceiling — fine for small N, add a
+    concurrency cap if someone runs huge N."""
+    print_divider()
+    log_step("◈", "SWARM", f"{base_query}  ·  {n} agents")
+    print_divider()
+
+    msgs = [{"role": "user", "content": SWARM_SPLIT_PROMPT.format(n=n, q=base_query)}]
+    spinner_start("Planning search scopes...")
+    content, _ = ask_ai(msgs, provider, model)
+    spinner_end()
+    queries = parse_query_list(content, n) or [base_query]
+    log_step("◉", "Swarm scopes", "  ·  ".join(queries))
+    print()
+
+    batches = await asyncio.gather(*[
+        run_scraper(q, max_results, None, True, no_website_only,
+                    silent=True, write_csv=False)
+        for q in queries
+    ], return_exceptions=True)
+
+    seen, merged = set(), []
+    for b in batches:
+        if isinstance(b, Exception):
+            log_warn(f"Agent failed: {str(b)[:60]}")
+            continue
+        for r in b:
+            k = r["Google Maps Link"]
+            if k not in seen:
+                seen.add(k)
+                merged.append(r)
+
+    if not output_file:
+        safe = re.sub(r'[^\w\s-]', '', base_query).strip().replace(' ', '_')
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        output_file = f"firmoscope_swarm_{safe}_{ts}.csv"
+    save_and_summarize(merged, output_file)
+    return merged
 
 
 # ─────────────────────────────────────────────────
@@ -637,6 +722,7 @@ AI_SYSTEM = (
 COMMANDS_HELP = (
     f"  {gray('Commands:')}  "
     f"{teal('/search')} manual scrape  ·  "
+    f"{teal('/swarm')} parallel multi-scope  ·  "
     f"{teal('/export sheets')} → Google Sheets  ·  "
     f"{teal('/provider')} switch AI backend  ·  "
     f"{teal('/exit')} quit"
@@ -807,12 +893,30 @@ def run_ai_repl(provider: str, model: str):
                 if cmd_arg:
                     # ponytail: inline search with arg, skip interactive prompt
                     import re as _re
-                    limit_m = _re.search(r"--limit\s+(\d+)", cmd_arg)
-                    limit = int(limit_m.group(1)) if limit_m else 20
-                    query = _re.sub(r"--limit\s+\d+", "", cmd_arg).strip()
+                    # ponytail: accept "--limit N" or a bare trailing number
+                    limit_m = _re.search(r"--limit\s+(\d+)|\s(\d+)\s*$", cmd_arg)
+                    limit = int(limit_m.group(1) or limit_m.group(2)) if limit_m else 20
+                    query = _re.sub(r"--limit\s+\d+|\s\d+\s*$", "", cmd_arg).strip()
                     _last_results = asyncio.run(run_scraper(query, limit, None, True, True)) or _last_results
                 else:
                     do_manual_search()
+                print()
+                print(COMMANDS_HELP)
+                print()
+                continue
+            elif cmd == "swarm":
+                if not cmd_arg:
+                    log_warn("Użycie: /swarm <query> [--limit N] [--agents K]")
+                else:
+                    import re as _re
+                    limit_m  = _re.search(r"--limit\s+(\d+)", cmd_arg)
+                    agents_m = _re.search(r"--agents\s+(\d+)", cmd_arg)
+                    limit  = int(limit_m.group(1)) if limit_m else 20
+                    agents = int(agents_m.group(1)) if agents_m else 3
+                    query  = _re.sub(r"--(limit|agents)\s+\d+", "", cmd_arg).strip()
+                    _last_results = asyncio.run(
+                        run_swarm(query, provider, model, agents, limit)
+                    ) or _last_results
                 print()
                 print(COMMANDS_HELP)
                 print()
@@ -851,7 +955,16 @@ def run_ai_repl(provider: str, model: str):
             if not tool_calls:
                 break
 
-            # Append assistant message WITH tool_calls (required by spec)
+            # Append assistant message WITH tool_calls (required by spec).
+            # ponytail: Ollama wants arguments as an object, OpenRouter as a JSON
+            # string — echoing the wrong shape gives Ollama a 400 ("can't find '}'").
+            def _echo_fn(fn):
+                if provider == "ollama":
+                    try:
+                        return {"name": fn["name"], "arguments": json.loads(fn["arguments"])}
+                    except Exception:
+                        return {"name": fn["name"], "arguments": {}}
+                return fn
             messages.append({
                 "role": "assistant",
                 "content": content or "",
@@ -859,7 +972,7 @@ def run_ai_repl(provider: str, model: str):
                     {
                         "id": tc["id"],
                         "type": "function",
-                        "function": tc["function"],
+                        "function": _echo_fn(tc["function"]),
                     }
                     for tc in tool_calls
                 ],
@@ -948,6 +1061,8 @@ def main():
                    help="Scrape QUERY then ask the AI this question about the results")
     p.add_argument("--chat", action="store_true", help="Open the interactive AI chat")
     p.add_argument("--model", help="Override AI model id")
+    p.add_argument("--swarm", type=int, metavar="K",
+                   help="Fan out K parallel agents over AI-generated sub-scopes")
     p.add_argument("--selftest", action="store_true", help="Run self-check and exit")
     args = p.parse_args()
 
@@ -960,6 +1075,20 @@ def main():
         print()
         log_success("Goodbye!")
         print()
+        return
+
+    # Swarm: parallel multi-scope scrape
+    if args.swarm:
+        provider, model = _resolve_provider(args.model)
+        asyncio.run(run_swarm(
+            base_query=args.query,
+            provider=provider,
+            model=model,
+            n=args.swarm,
+            max_results=args.limit,
+            no_website_only=args.no_website,
+            output_file=args.output,
+        ))
         return
 
     # One-shot scrape
@@ -1028,6 +1157,13 @@ def _selftest():
         assert False, "Should have raised"
     except ValueError:
         pass
+
+    # parse_query_list — fenced JSON, cap at n, garbage → []
+    fenced = 'Sure!\n```json\n["a", "b", "c", "d"]\n```'
+    assert parse_query_list(fenced, 3) == ["a", "b", "c"]
+    assert parse_query_list('["x","y"]', 5) == ["x", "y"]
+    assert parse_query_list("no array here", 3) == []
+    assert parse_query_list("", 3) == []
 
     print(green("✓") + "  Self-test passed.")
 

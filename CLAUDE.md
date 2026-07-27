@@ -23,6 +23,10 @@ python firmoscope.py "Kraków Fryzjer" --no-headless
 python firmoscope.py "Rybnik Mechanicy" --limit 10 --ai "które firmy nie mają strony?"
 python firmoscope.py "Rybnik Mechanicy" --limit 10 --chat
 python firmoscope.py "Rybnik Mechanicy" --chat --model "anthropic/claude-3.5-haiku"
+
+# Swarm — AI splits the query into K sub-scopes, scrapes them in parallel, merges to one CSV
+python firmoscope.py "Rybnik Mechanicy" --swarm 3 --limit 20
+# In chat: /swarm Rybnik Mechanicy --limit 20 --agents 3
 ```
 
 ## Architecture
