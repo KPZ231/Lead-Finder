@@ -146,6 +146,9 @@ def prompt(symbol="❯", color=C.TEAL, completer=None):
 EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
 PHONE_RE = re.compile(r'(\+?[\d\s\-().]{7,18}\d)')
 
+# ponytail: tabs open at once during detail scraping; lower if Google rate-limits
+DETAIL_CONCURRENCY = 5
+
 def extract_emails_from_text(text: str) -> list:
     return list(set(EMAIL_RE.findall(text)))
 
@@ -321,7 +324,10 @@ async def scrape_business_details(page, url: str) -> dict:
     details = {"phone": "", "email": "", "address": "", "website": ""}
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-        await page.wait_for_timeout(1800)
+        try:
+            await page.wait_for_selector('h1, [data-item-id]', timeout=4000)
+        except Exception:
+            await page.wait_for_timeout(500)
         html = await page.content()
 
         # Phone from aria-label or text
@@ -380,7 +386,7 @@ async def try_scrape_website_for_email(page, website_url: str) -> str:
         return ""
     try:
         await page.goto(website_url, wait_until="domcontentloaded", timeout=10000)
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(400)
         html = await page.content()
         emails = extract_emails_from_text(html)
         filtered = [e for e in emails if not any(x in e.lower() for x in ["google", "example", "schema", "sentry"])]
@@ -390,7 +396,7 @@ async def try_scrape_website_for_email(page, website_url: str) -> str:
             try:
                 base = website_url.rstrip("/")
                 await page.goto(base + path, wait_until="domcontentloaded", timeout=7000)
-                await page.wait_for_timeout(800)
+                await page.wait_for_timeout(400)
                 html2 = await page.content()
                 emails2 = extract_emails_from_text(html2)
                 filtered2 = [e for e in emails2 if not any(x in e.lower() for x in ["google", "example", "schema"])]
@@ -487,6 +493,14 @@ async def run_scraper(query: str, max_results: int = 20, output_file: str = None
                 "Chrome/124.0.0.0 Safari/537.36"
             )
         )
+        # ponytail: we only parse HTML/text — skip rendering-only resources for speed
+        async def _block_heavy(route):
+            if route.request.resource_type in ("image", "media", "font", "stylesheet"):
+                await route.abort()
+            else:
+                await route.continue_()
+        await context.route("**/*", _block_heavy)
+
         page = await context.new_page()
         spinner_end("OK")
 
@@ -496,7 +510,10 @@ async def run_scraper(query: str, max_results: int = 20, output_file: str = None
         for attempt in range(2):
             try:
                 await page.goto(maps_url, wait_until="domcontentloaded", timeout=20000)
-                await page.wait_for_timeout(2500)
+                try:
+                    await page.wait_for_selector('div[role="feed"]', timeout=6000)
+                except Exception:
+                    await page.wait_for_timeout(1500)
                 last_err = None
                 break
             except Exception as e:
@@ -561,10 +578,10 @@ async def run_scraper(query: str, max_results: int = 20, output_file: str = None
                     await panel.evaluate("el => el.scrollBy(0, 1500)")
                 else:
                     await page.mouse.wheel(0, 1500)
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(900)
             except Exception:
                 await page.mouse.wheel(0, 1500)
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(900)
 
             scroll_attempts += 1
 
@@ -582,52 +599,61 @@ async def run_scraper(query: str, max_results: int = 20, output_file: str = None
         print(header_line)
         print(DIVIDER)
 
-        for idx, link in enumerate(business_links, 1):
-            try:
-                details = await scrape_business_details(page, link)
+        sem = asyncio.Semaphore(DETAIL_CONCURRENCY)
 
-                name = ""
+        async def process(idx, link):
+            async with sem:
+                detail_page = await context.new_page()
                 try:
-                    name_match = re.search(r'/maps/place/([^/@]+)', link)
-                    if name_match:
-                        name = name_match.group(1).replace("+", " ").replace("%20", " ")
-                        name = re.sub(r'%[0-9A-Fa-f]{2}', ' ', name).strip()
-                except Exception:
-                    pass
+                    details = await scrape_business_details(detail_page, link)
 
-                if not name:
+                    name = ""
                     try:
-                        el = await page.query_selector('h1')
-                        if el:
-                            name = await el.text_content() or ""
+                        name_match = re.search(r'/maps/place/([^/@]+)', link)
+                        if name_match:
+                            name = name_match.group(1).replace("+", " ").replace("%20", " ")
+                            name = re.sub(r'%[0-9A-Fa-f]{2}', ' ', name).strip()
                     except Exception:
-                        name = f"Business #{idx}"
+                        pass
 
-                has_website = bool(details.get("website"))
+                    if not name:
+                        try:
+                            el = await detail_page.query_selector('h1')
+                            if el:
+                                name = await el.text_content() or ""
+                        except Exception:
+                            name = f"Business #{idx}"
 
-                if no_website_only and has_website:
-                    continue
+                    has_website = bool(details.get("website"))
 
-                email = details.get("email", "")
-                if not email and has_website:
-                    email = await try_scrape_website_for_email(page, details["website"])
+                    if no_website_only and has_website:
+                        return None
 
-                result = {
-                    "Name":             name,
-                    "Phone":            details.get("phone", ""),
-                    "Email":            email,
-                    "Address":          details.get("address", ""),
-                    "Website":          details.get("website", ""),
-                    "Has Website":      "YES" if has_website else "NO",
-                    "Google Maps Link": link,
-                }
+                    email = details.get("email", "")
+                    if not email and has_website:
+                        email = await try_scrape_website_for_email(detail_page, details["website"])
+
+                    return {
+                        "Name":             name,
+                        "Phone":            details.get("phone", ""),
+                        "Email":            email,
+                        "Address":          details.get("address", ""),
+                        "Website":          details.get("website", ""),
+                        "Has Website":      "YES" if has_website else "NO",
+                        "Google Maps Link": link,
+                    }
+                except Exception as e:
+                    log_warn(f"Error at business #{idx}: {str(e)[:60]}")
+                    return None
+                finally:
+                    await detail_page.close()
+
+        gathered = await asyncio.gather(*(process(i, l) for i, l in enumerate(business_links, 1)))
+        for result in gathered:
+            if result:
                 results.append(result)
-                log_found(len(results), name, details.get("phone", ""), email,
-                          details.get("address", ""), has_website)
-
-            except Exception as e:
-                log_warn(f"Error at business #{idx}: {str(e)[:60]}")
-                continue
+                log_found(len(results), result["Name"], result["Phone"], result["Email"],
+                          result["Address"], result["Has Website"] == "YES")
 
         print()
         print_divider()
